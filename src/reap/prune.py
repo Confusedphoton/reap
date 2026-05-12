@@ -133,16 +133,27 @@ def prune(
                 )
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            # prune fused experts (tested for llama-4 and Qwen3.5/3.6 MoE).
+            n_retained = len(retained_expert_indicies)
+            experts_module = getattr(moe, model_attrs["experts"])
+            gate_proj_attr = model_attrs["gate_proj"]  # e.g. "gate_up_proj"
+            down_proj_attr = model_attrs["down_proj"]
+            gate_up = getattr(experts_module, gate_proj_attr)
+            down = getattr(experts_module, down_proj_attr)
+            gate_up.data = gate_up.data[retained_expert_indicies]
+            down.data = down.data[retained_expert_indicies]
+            if hasattr(experts_module, "num_experts"):
+                experts_module.num_experts = n_retained
+            if hasattr(moe, "num_experts"):
+                moe.num_experts = n_retained
+            # Router attribute name differs across architectures: Llama4 uses
+            # "router", Qwen3.5/3.6 MoE uses "gate".
+            router = getattr(moe, model_attrs["router"])
+            router.weight.data = router.weight.data[retained_expert_indicies]
+            if hasattr(router, "out_features"):
+                router.out_features = n_retained
+            if hasattr(router, "num_experts"):  # transformers >= 4.54+
+                router.num_experts = n_retained
 
     # patch config and dump
     logger.info("Saving pruned model...")
@@ -223,7 +234,6 @@ def main():
         device_map="auto",
         torch_dtype="auto",
         trust_remote_code=True,
-        local_files_only=True,
     )
     # record activations or load previously recorded activations
     logger.info(

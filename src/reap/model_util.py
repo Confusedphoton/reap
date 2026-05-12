@@ -5,35 +5,40 @@ logger = logging.getLogger(__name__)
 
 
 MODEL_ATTRS = {
+    # Qwen3 MoE in transformers v5 switched to a fused-expert layout: each
+    # SparseMoeBlock now exposes `experts.gate_up_proj` / `experts.down_proj`
+    # parameter slabs and a `gate` router that returns
+    # (router_logits, router_scores, router_indices). Pruning uses the fused
+    # branch in `prune.py`.
     "Qwen3MoeForCausalLM": {
         "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
         "down_proj": "down_proj",
         "experts": "experts",
-        "fused": False,
+        "fused": True,
         "router": "gate",
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
     "Qwen3-Coder-30B-A3B-Instruct": {
         "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
         "down_proj": "down_proj",
         "experts": "experts",
-        "fused": False,
+        "fused": True,
         "router": "gate",
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
     "NonUniformQwen3MoeForCausalLM": {
         "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
         "down_proj": "down_proj",
         "experts": "experts",
-        "fused": False,
+        "fused": True,
         "router": "gate",
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
@@ -113,6 +118,23 @@ MODEL_ATTRS = {
         "fused": False,
         "router": "gate",
         "num_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+    # Qwen3.5 / Qwen3.6 MoE (e.g. Qwen/Qwen3.6-35B-A3B). The VLM checkpoint's
+    # architectures field is `Qwen3_5MoeForConditionalGeneration`, but
+    # AutoModelForCausalLM auto-extracts the text_config and instantiates the
+    # text-only `Qwen3_5MoeForCausalLM` class (see transformers auto_factory).
+    # The SMoE block exposes a fused expert tensor pair (gate_up_proj/down_proj)
+    # plus a separate shared expert that we leave untouched during pruning.
+    "Qwen3_5MoeForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
 }
