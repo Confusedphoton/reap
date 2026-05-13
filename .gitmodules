@@ -6,7 +6,7 @@
     url = https://github.com/mklasby/llm-compressor.git
 [submodule "third-party/LiveCodeBench"]
     path = third-party/LiveCodeBench
-    url = https://github.com/mklasby/LiveCodeBench.git
+	url = https://github.com/Confusedphoton/livecodebench_mistral_path.git
 [submodule "third-party/helm"]
     path = third-party/helm
     url = https://github.com/mklasby/helm.git
