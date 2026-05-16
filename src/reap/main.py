@@ -221,6 +221,7 @@ def record_activations(
                 batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
                 dataset_config_path=ds_args.dataset_config_path,
+                map_num_proc=obs_args.map_num_proc,
             )
             combined_batches.extend(component_batches["all"])
 
@@ -238,6 +239,7 @@ def record_activations(
             batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
             dataset_config_path=ds_args.dataset_config_path,
+            map_num_proc=obs_args.map_num_proc,
         )
 
     logger.info(

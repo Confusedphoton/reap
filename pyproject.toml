@@ -32,7 +32,7 @@ dependencies = [
     "trl>=0.21.0",
     "hatchling>=1.27.0",
     # "flash-attn>=2.7.1,<=2.8.0", # required for xformers for Llama4. Might need to manually install with --no-build-isolation
-    # "flash-attn>=2.8.3",
+    "flash-attn>=2.8.3",
     "wandb>=0.21.1",
     "crfm-helm",
     "evalscope",

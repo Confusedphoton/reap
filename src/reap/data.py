@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+import os
 import uuid
 import json
 import re
@@ -41,6 +42,16 @@ from reap.dataset_config import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_map_num_proc(map_num_proc: int | None) -> int | None:
+    """Return ``num_proc`` for HuggingFace ``Dataset.map`` (None = single-process)."""
+    if map_num_proc is not None:
+        return map_num_proc if map_num_proc > 1 else None
+    cpus = os.cpu_count() or 1
+    if cpus <= 1:
+        return None
+    return cpus - 1
 
 
 def _maybe_json_load(value):
@@ -274,6 +285,7 @@ class BaseDatasetProcessor(ABC):
         truncate: bool = False,
         select_only_categories: list[str] | str | None = None,
         batch_size: int = 1,
+        map_num_proc: int | None = None,
     ):
         """Defines base functionality for all Dataset Processors.
 
@@ -289,6 +301,9 @@ class BaseDatasetProcessor(ABC):
                 clip to ``max_input_len`` when building calibration batches (rows
                 are never dropped for length).
             batch_size (int, optional): Number of samples per batch. Defaults to 1.
+            map_num_proc (int | None, optional): Worker processes for parallel
+                ``Dataset.map`` row preprocessing. None uses ``max(1, cpu_count - 1)``.
+                Set to 1 to force single-process mapping.
 
         """
         if isinstance(dataset, DatasetDict):
@@ -318,6 +333,7 @@ class BaseDatasetProcessor(ABC):
             select_only_categories = [select_only_categories]
         self.select_only_categories = select_only_categories
         self.batch_size = batch_size
+        self.map_num_proc = map_num_proc
         self._row_map_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         if self.select_only_categories:
             logger.warning(
@@ -366,7 +382,11 @@ class BaseDatasetProcessor(ABC):
 
     def _map_dataset_rows(self) -> Dataset:
         map_fn = self._row_map_fn or self._map_fn
-        return self.dataset.map(map_fn)
+        num_proc = _resolve_map_num_proc(self.map_num_proc)
+        map_kwargs: dict[str, Any] = {"desc": "Mapping dataset rows"}
+        if num_proc is not None:
+            map_kwargs["num_proc"] = num_proc
+        return self.dataset.map(map_fn, **map_kwargs)
 
     def get_processed_dataset(
         self, batches_per_category: int
@@ -1020,6 +1040,7 @@ def load_category_batches(
     truncate,
     batches_per_category,
     dataset_config_path=None,
+    map_num_proc: int | None = None,
 ):
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
@@ -1038,6 +1059,7 @@ def load_category_batches(
         return_vllm_tokens_prompt=return_vllm_tokens_prompt,
         truncate=truncate,
         batch_size=batch_size,
+        map_num_proc=map_num_proc,
     )
     return processor.get_processed_dataset(
         batches_per_category=batches_per_category,

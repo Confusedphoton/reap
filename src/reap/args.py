@@ -134,6 +134,16 @@ class ObserverArgs:
             ),
         },
     )
+    map_num_proc: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of worker processes for parallel HuggingFace dataset row "
+                "mapping. None uses max(1, cpu_count - 1). Set to 1 to disable "
+                "multiprocessing."
+            ),
+        },
+    )
     overwrite_observations: bool = field(
         default=False,
         metadata={"help": "Whether to overwrite existing observer data files."},
