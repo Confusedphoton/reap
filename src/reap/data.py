@@ -17,6 +17,7 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 import os
@@ -25,6 +26,7 @@ import json
 import re
 import random
 import logging
+import multiprocessing as mp
 
 
 import torch
@@ -45,13 +47,81 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_map_num_proc(map_num_proc: int | None) -> int | None:
-    """Return ``num_proc`` for HuggingFace ``Dataset.map`` (None = single-process)."""
+    """Return worker count for parallel data loading (None = single-process).
+
+    Used for HuggingFace ``Dataset.map``, per-category batch building, and
+    sample tokenization. Defaults to ``max(1, cpu_count - 1)`` when unset.
+    """
     if map_num_proc is not None:
         return map_num_proc if map_num_proc > 1 else None
     cpus = os.cpu_count() or 1
     if cpus <= 1:
         return None
     return cpus - 1
+
+
+# Process-pool worker state (set via pool initializers; not thread-safe).
+_MP_PROCESSOR: Any = None
+_MP_CATEGORY_DATASET: Dataset | None = None
+_MP_PACKED_CONTEXT: _PackedBatchContext | None = None
+
+
+@dataclass(frozen=True)
+class _PackedBatchContext:
+    category: str
+    batches_per_category: int
+    return_vllm_tokens_prompt: bool
+    batch_size: int
+
+
+def _set_mp_processor(processor: Any) -> None:
+    global _MP_PROCESSOR
+    _MP_PROCESSOR = processor
+
+
+def _set_mp_packed_context(
+    processor: Any,
+    category_dataset: Dataset,
+    packed_context: _PackedBatchContext,
+) -> None:
+    global _MP_PROCESSOR, _MP_CATEGORY_DATASET, _MP_PACKED_CONTEXT
+    _MP_PROCESSOR = processor
+    _MP_CATEGORY_DATASET = category_dataset
+    _MP_PACKED_CONTEXT = packed_context
+
+
+def _encode_sample_mp(sample: dict[str, Any]) -> torch.Tensor:
+    if _MP_PROCESSOR is None:
+        raise RuntimeError("Multiprocessing encode worker is missing processor state")
+    return _MP_PROCESSOR._fit_encoded_sample(_MP_PROCESSOR._encode_sample(sample))
+
+
+def _process_category_mp(
+    args: tuple[str, int],
+) -> tuple[str, list[TokensPrompt] | list[BatchEncoding]]:
+    category, batches_per_category = args
+    if _MP_PROCESSOR is None:
+        raise RuntimeError("Multiprocessing category worker is missing processor state")
+    batches = _MP_PROCESSOR._process_batches_for_category(
+        category,
+        batches_per_category,
+        parallel_categories=False,
+    )
+    return category, batches
+
+
+def _build_packed_batch_mp(_batch_idx: int) -> TokensPrompt | dict[str, torch.Tensor]:
+    if (
+        _MP_PROCESSOR is None
+        or _MP_CATEGORY_DATASET is None
+        or _MP_PACKED_CONTEXT is None
+    ):
+        raise RuntimeError("Multiprocessing packed-batch worker is missing state")
+    return _MP_PROCESSOR._build_one_packed_batch(
+        _MP_CATEGORY_DATASET,
+        _MP_PACKED_CONTEXT.category,
+        _MP_PACKED_CONTEXT.return_vllm_tokens_prompt,
+    )
 
 
 def _maybe_json_load(value):
@@ -302,8 +372,9 @@ class BaseDatasetProcessor(ABC):
                 are never dropped for length).
             batch_size (int, optional): Number of samples per batch. Defaults to 1.
             map_num_proc (int | None, optional): Worker processes for parallel
-                ``Dataset.map`` row preprocessing. None uses ``max(1, cpu_count - 1)``.
-                Set to 1 to force single-process mapping.
+                dataset mapping, category batch building, and tokenization.
+                None uses ``max(1, cpu_count - 1)``. Set to 1 to disable
+                multiprocessing.
 
         """
         if isinstance(dataset, DatasetDict):
@@ -400,16 +471,105 @@ class BaseDatasetProcessor(ABC):
                 if self.select_only_categories is None
                 else self.select_only_categories
             )
+            return self._process_all_categories(categories, batches_per_category)
+        return {
+            self.all_categories_label: self._process_batches_for_category(
+                self.all_categories_label,
+                batches_per_category,
+            ),
+        }
+
+    def _process_all_categories(
+        self,
+        categories: list[str],
+        batches_per_category: int,
+    ) -> dict[str, list[TokensPrompt]] | dict[str, list[BatchEncoding]]:
+        num_proc = _resolve_map_num_proc(self.map_num_proc)
+        if num_proc is None or len(categories) <= 1:
             return {
-                c: self._process_batches_for_category(c, batches_per_category)
-                for c in categories
+                category: self._process_batches_for_category(
+                    category, batches_per_category
+                )
+                for category in categories
             }
-        else:
+
+        max_workers = min(num_proc, len(categories))
+        logger.info(
+            "Processing %d categories with %d worker processes",
+            len(categories),
+            max_workers,
+        )
+        results: dict[str, list[TokensPrompt] | list[BatchEncoding]] = {}
+        try:
+            mp_context = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_context,
+                initializer=_set_mp_processor,
+                initargs=(self,),
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _process_category_mp, (category, batches_per_category)
+                    ): category
+                    for category in categories
+                }
+                for future in as_completed(futures):
+                    category, batches = future.result()
+                    results[category] = batches
+        except Exception as exc:
+            logger.warning(
+                "Parallel category processing failed (%s); falling back to "
+                "single-process loading",
+                exc,
+            )
             return {
-                self.all_categories_label: self._process_batches_for_category(
-                    self.all_categories_label, batches_per_category
-                ),
+                category: self._process_batches_for_category(
+                    category, batches_per_category
+                )
+                for category in categories
             }
+        return results
+
+    def _encode_samples_parallel(
+        self,
+        samples: list[dict[str, Any]],
+        *,
+        allow_parallel: bool = True,
+    ) -> list[torch.Tensor]:
+        if not samples:
+            return []
+
+        num_proc = _resolve_map_num_proc(self.map_num_proc) if allow_parallel else None
+        if num_proc is None or len(samples) == 1:
+            return [
+                self._fit_encoded_sample(self._encode_sample(sample))
+                for sample in samples
+            ]
+
+        max_workers = min(num_proc, len(samples))
+        try:
+            mp_context = mp.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_context,
+                initializer=_set_mp_processor,
+                initargs=(self,),
+            ) as executor:
+                chunksize = max(1, len(samples) // (max_workers * 4))
+                return list(
+                    executor.map(_encode_sample_mp, samples, chunksize=chunksize)
+                )
+        except Exception as exc:
+            logger.warning(
+                "Parallel sample encoding failed (%s); falling back to "
+                "single-process encoding",
+                exc,
+            )
+            return [
+                self._fit_encoded_sample(self._encode_sample(sample))
+                for sample in samples
+            ]
 
     def get_categories(self) -> list[str]:
         """Get the unique categories in the dataset."""
@@ -424,6 +584,7 @@ class BaseDatasetProcessor(ABC):
         self,
         category: str,
         batches_per_category: int,
+        parallel_categories: bool = True,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
         if category != self.all_categories_label:
             category_dataset = self._mapped_dataset.filter(
@@ -435,12 +596,17 @@ class BaseDatasetProcessor(ABC):
 
         if self.pack_samples:
             return self._process_batches_for_category_packed(
-                category, batches_per_category, category_dataset
+                category,
+                batches_per_category,
+                category_dataset,
+                parallel_categories=parallel_categories,
             )
-        else:
-            return self._process_batches_for_category_unpacked(
-                category, batches_per_category, category_dataset
-            )
+        return self._process_batches_for_category_unpacked(
+            category,
+            batches_per_category,
+            category_dataset,
+            parallel_encoding=parallel_categories,
+        )
 
     def _collate_batch(self, batch: list[dict[str, torch.Tensor]]) -> BatchEncoding:
         """Collate a list of tokenized samples into a padded batch.
@@ -494,112 +660,223 @@ class BaseDatasetProcessor(ABC):
             }
         )
 
+    def _sample_unique_indices(
+        self,
+        category: str,
+        category_dataset: Dataset,
+        num_samples: int,
+        sampled: list[int],
+    ) -> list[int]:
+        """Draw up to ``num_samples`` unique row indices without replacement."""
+        if len(category_dataset) == 0:
+            return []
+
+        sampled_set = set(sampled)
+        new_indices: list[int] = []
+        attempts = 0
+        max_attempts = max(num_samples * 20, 1)
+        while len(new_indices) < num_samples and attempts < max_attempts:
+            attempts += 1
+            if len(sampled_set) >= len(category_dataset):
+                break
+            sample_idx = random.randint(0, len(category_dataset) - 1)
+            if sample_idx in sampled_set:
+                continue
+            sampled_set.add(sample_idx)
+            new_indices.append(sample_idx)
+
+        if len(new_indices) < num_samples:
+            logger.warning(
+                "Not enough unique samples in category '%s' to collect %d rows; "
+                "only %d were available.",
+                category,
+                num_samples,
+                len(new_indices),
+            )
+        sampled.extend(new_indices)
+        return new_indices
+
+    def _build_one_packed_batch(
+        self,
+        category_dataset: Dataset,
+        category: str,
+        return_vllm_tokens_prompt: bool,
+    ) -> TokensPrompt | dict[str, torch.Tensor]:
+        sampled: list[int] = []
+        seq = torch.zeros((1, self.max_input_len), dtype=torch.long)
+        seq_idx = 0
+        attention_mask = torch.zeros((1, self.max_input_len), dtype=torch.long)
+        while seq_idx < self.max_input_len:
+            if len(sampled) >= len(category_dataset):
+                logger.warning(
+                    "Not enough samples to pack sequence to max_input_len in "
+                    "category '%s'.",
+                    category,
+                )
+                break
+            new_indices = self._sample_unique_indices(
+                category,
+                category_dataset,
+                num_samples=1,
+                sampled=sampled,
+            )
+            if not new_indices:
+                break
+            sample = category_dataset[new_indices[0]]
+            encoded_sample = self._fit_encoded_sample(self._encode_sample(sample))
+            end_seq = seq_idx + encoded_sample.shape[-1]
+            if end_seq > self.max_input_len:
+                encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
+                end_seq = self.max_input_len
+            seq[:, seq_idx:end_seq] = encoded_sample
+            attention_mask[:, seq_idx:end_seq] = 1
+            seq_idx = end_seq + 1
+
+        if return_vllm_tokens_prompt:
+            return TokensPrompt(prompt_token_ids=seq[0, :-1].tolist())
+        return {"input_ids": seq, "attention_mask": attention_mask}
+
     def _process_batches_for_category_unpacked(
         self,
         category: str,
         batches_per_category: int,
         category_dataset: Dataset,
+        parallel_encoding: bool = True,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
-        processed_samples = []
-        sampled = []  # sample without replacement
-        current_batch = []
-        while len(processed_samples) < batches_per_category:
-            if len(sampled) >= len(category_dataset):
-                logger.warning(
-                    f"Not enough samples in category '{category}' to reach "
-                    f"{batches_per_category} data batches. Only {len(sampled)} "
-                    "samples were processed.",
-                )
-                break
-            sample_idx = random.randint(0, len(category_dataset) - 1)
-            if sample_idx in sampled:
-                continue
-            sampled.append(sample_idx)
-            sample = category_dataset[sample_idx]
-            encoded_sample = self._fit_encoded_sample(self._encode_sample(sample))
+        if self.return_vllm_tokens_prompt:
+            target_samples = batches_per_category
+        else:
+            target_samples = batches_per_category * self.batch_size
+
+        sampled: list[int] = []
+        sample_indices = self._sample_unique_indices(
+            category,
+            category_dataset,
+            target_samples,
+            sampled,
+        )
+        if not sample_indices:
+            return []
+
+        samples = [category_dataset[sample_idx] for sample_idx in sample_indices]
+        encoded_samples = self._encode_samples_parallel(
+            samples,
+            allow_parallel=parallel_encoding,
+        )
+
+        if self.return_vllm_tokens_prompt:
+            return [
+                TokensPrompt(prompt_token_ids=encoded_sample[0, :-1].tolist())
+                for encoded_sample in encoded_samples
+            ]
+
+        processed_samples: list[BatchEncoding] = []
+        current_batch: list[dict[str, torch.Tensor]] = []
+        for encoded_sample in encoded_samples:
             attention_mask = torch.ones((1, encoded_sample.shape[-1]), dtype=torch.long)
+            current_batch.append(
+                {"input_ids": encoded_sample, "attention_mask": attention_mask}
+            )
+            if len(current_batch) >= self.batch_size:
+                processed_samples.append(self._collate_batch(current_batch))
+                current_batch = []
 
-            if self.return_vllm_tokens_prompt:
-                encoded_sample = TokensPrompt(
-                    prompt_token_ids=encoded_sample[0, :-1].tolist()
-                )
-                processed_samples.append(encoded_sample)
-            else:
-                current_batch.append(
-                    {"input_ids": encoded_sample, "attention_mask": attention_mask}
-                )
-                if len(current_batch) >= self.batch_size:
-                    batched = self._collate_batch(current_batch)
-                    processed_samples.append(batched)
-                    current_batch = []
+        if current_batch:
+            processed_samples.append(self._collate_batch(current_batch))
 
-        # handle remaining samples in the last batch
-        if current_batch and not self.return_vllm_tokens_prompt:
-            batched = self._collate_batch(current_batch)
-            processed_samples.append(batched)
-
-        return processed_samples
+        if len(processed_samples) < batches_per_category:
+            logger.warning(
+                "Not enough samples in category '%s' to reach %d data batches. "
+                "Only %d batches were produced.",
+                category,
+                batches_per_category,
+                len(processed_samples),
+            )
+        return processed_samples[:batches_per_category]
 
     def _process_batches_for_category_packed(
         self,
         category: str,
         batches_per_category: int,
         category_dataset: Dataset,
+        parallel_categories: bool = True,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
-        processed_samples = []
-        sampled = []
-        current_batch = []
-        while len(processed_samples) < batches_per_category:
-            if len(sampled) >= len(category_dataset):
-                logger.warning(
-                    f"Not enough samples in category '{category}' to reach "
-                    f"{batches_per_category} data batches. Only {len(sampled)} "
-                    "samples were processed.",
-                )
-                break
-            seq = torch.zeros((1, self.max_input_len), dtype=torch.long)
-            seq_idx = 0
-            attention_mask = torch.zeros((1, self.max_input_len), dtype=torch.long)
-            while seq_idx < self.max_input_len:
-                if len(sampled) >= len(category_dataset):
-                    logger.warning(
-                        f"Not enough samples to pack last sequence to max_input_len."
+        num_proc = _resolve_map_num_proc(self.map_num_proc)
+        use_parallel_batches = (
+            num_proc is not None
+            and batches_per_category > 1
+            and not parallel_categories
+        )
+
+        if use_parallel_batches:
+            packed_context = _PackedBatchContext(
+                category=category,
+                batches_per_category=batches_per_category,
+                return_vllm_tokens_prompt=self.return_vllm_tokens_prompt,
+                batch_size=self.batch_size,
+            )
+            max_workers = min(num_proc, batches_per_category)
+            try:
+                mp_context = mp.get_context("spawn")
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    mp_context=mp_context,
+                    initializer=_set_mp_packed_context,
+                    initargs=(self, category_dataset, packed_context),
+                ) as executor:
+                    packed_items = list(
+                        executor.map(
+                            _build_packed_batch_mp,
+                            range(batches_per_category),
+                        )
                     )
-                    break
-                sample_idx = random.randint(0, len(category_dataset) - 1)
-                if sample_idx in sampled:
-                    continue
-                sampled.append(sample_idx)
-                sample = category_dataset[sample_idx]
-                encoded_sample = self._fit_encoded_sample(
-                    self._encode_sample(sample)
+            except Exception as exc:
+                logger.warning(
+                    "Parallel packed-batch building failed (%s); falling back to "
+                    "single-process loading",
+                    exc,
                 )
-                end_seq = seq_idx + encoded_sample.shape[-1]
-                if end_seq > self.max_input_len:
-                    encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
-                    end_seq = self.max_input_len
-                seq[:, seq_idx:end_seq] = encoded_sample
-                attention_mask[:, seq_idx:end_seq] = 1
-                seq_idx = end_seq + 1
-            if self.return_vllm_tokens_prompt:
-                encoded_sample = TokensPrompt(
-                    prompt_token_ids=seq[0, :-1].tolist()  # -1 for vLLM.LLM.generate
-                )
-                processed_samples.append(encoded_sample)
+                use_parallel_batches = False
             else:
-                current_batch.append(
-                    {"input_ids": seq, "attention_mask": attention_mask}
-                )
+                return self._collate_packed_batch_items(packed_items)
+
+        processed_samples: list[TokensPrompt] | list[BatchEncoding] = []
+        current_batch: list[dict[str, torch.Tensor]] = []
+        while len(processed_samples) < batches_per_category:
+            packed_item = self._build_one_packed_batch(
+                category_dataset,
+                category,
+                self.return_vllm_tokens_prompt,
+            )
+            if self.return_vllm_tokens_prompt:
+                processed_samples.append(packed_item)
+            else:
+                current_batch.append(packed_item)
                 if len(current_batch) >= self.batch_size:
-                    batched = self._collate_batch(current_batch)
-                    processed_samples.append(batched)
+                    processed_samples.append(self._collate_batch(current_batch))
                     current_batch = []
 
-        # handle remaining samples in the last batch
         if current_batch and not self.return_vllm_tokens_prompt:
-            batched = self._collate_batch(current_batch)
-            processed_samples.append(batched)
+            processed_samples.append(self._collate_batch(current_batch))
 
+        return processed_samples
+
+    def _collate_packed_batch_items(
+        self,
+        packed_items: list[TokensPrompt | dict[str, torch.Tensor]],
+    ) -> list[TokensPrompt] | list[BatchEncoding]:
+        if self.return_vllm_tokens_prompt:
+            return packed_items
+
+        processed_samples: list[BatchEncoding] = []
+        current_batch: list[dict[str, torch.Tensor]] = []
+        for packed_item in packed_items:
+            current_batch.append(packed_item)
+            if len(current_batch) >= self.batch_size:
+                processed_samples.append(self._collate_batch(current_batch))
+                current_batch = []
+        if current_batch:
+            processed_samples.append(self._collate_batch(current_batch))
         return processed_samples
 
 
@@ -1042,6 +1319,11 @@ def load_category_batches(
     dataset_config_path=None,
     map_num_proc: int | None = None,
 ):
+    """Load a dataset and build tokenized calibration batches per category.
+
+    Parallelism is controlled by ``map_num_proc`` (row mapping, per-category batch
+    building, and tokenization). Defaults to ``max(1, cpu_count - 1)`` workers.
+    """
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
     proc_cls = resolve_dataset_processor(

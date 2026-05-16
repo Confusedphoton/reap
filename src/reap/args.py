@@ -138,9 +138,9 @@ class ObserverArgs:
         default=None,
         metadata={
             "help": (
-                "Number of worker processes for parallel HuggingFace dataset row "
-                "mapping. None uses max(1, cpu_count - 1). Set to 1 to disable "
-                "multiprocessing."
+                "Number of worker processes for parallel dataset row mapping, "
+                "category batch building, and tokenization. None uses "
+                "max(1, cpu_count - 1). Set to 1 to disable multiprocessing."
             ),
         },
     )

@@ -110,6 +110,36 @@ def test_resolve_dataset_processor_auto_detect():
     assert len(batches["all"]) == 1
 
 
+def test_parallel_category_batch_processing():
+    dataset = Dataset.from_dict(
+        {
+            "instruction": ["a1", "a2", "b1", "b2"],
+            "output": ["x1", "x2", "y1", "y2"],
+            "subject": ["cat_a", "cat_a", "cat_b", "cat_b"],
+        }
+    )
+    proc_cls = ConfiguredDatasetProcessor.for_spec(
+        DatasetProcessorSpec(
+            processor="instruction",
+            category_field="subject",
+        )
+    )
+    processor = proc_cls(
+        dataset=dataset,
+        tokenizer=_FakeTokenizer(),
+        max_input_len=32,
+        split_by_category=True,
+        truncate=False,
+        batch_size=1,
+        pack_samples=False,
+        map_num_proc=2,
+    )
+    batches = processor.get_processed_dataset(batches_per_category=1)
+    assert set(batches.keys()) == {"cat_a", "cat_b"}
+    assert len(batches["cat_a"]) == 1
+    assert len(batches["cat_b"]) == 1
+
+
 def test_fit_encoded_sample_never_skips_long_rows():
     dataset = Dataset.from_dict(
         {

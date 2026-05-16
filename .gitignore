@@ -15,6 +15,7 @@ scratch/
 *.log
 .env
 .uv_cache/
+uv.lock
 wandb/
 api-key.txt
 prod_env/credentials.conf
