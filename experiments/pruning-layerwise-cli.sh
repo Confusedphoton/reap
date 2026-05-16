@@ -1,4 +1,5 @@
 #!/bin/bash
+# See experiments/pruning-cli.sh for positional argument layout.
 
 export CUDA_VISIBLE_DEVICES=${1}
 FIRST_DEVICE=$(echo "$1" | cut -d',' -f1)
@@ -36,7 +37,11 @@ singleton_outlier_experts=${13:-"false"}
 num_batches=128
 batch_size=8
 truncate=false
-dataset_config_path=${14:-}
+dataset_config_path="${REAP_DATASET_CONFIG_PATH:-${14:-}}"
+if [[ -z "${dataset_config_path}" && "${singleton_outlier_experts}" == *.json ]]; then
+    dataset_config_path="${singleton_outlier_experts}"
+    singleton_outlier_experts="false"
+fi
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 

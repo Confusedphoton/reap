@@ -1,4 +1,10 @@
 #!/bin/bash
+# Usage:
+#   bash experiments/pruning-cli.sh GPU MODEL METHOD SEED COMPRESSION DATASET \
+#     [lm_eval] [evalplus] [livecodebench] [math] [wildbench] \
+#     [singleton_super] [singleton_outlier] [dataset_config.json]
+#
+# Or set REAP_DATASET_CONFIG_PATH instead of the last positional argument.
 
 export CUDA_VISIBLE_DEVICES=${1}
 FIRST_DEVICE=$(echo "$1" | cut -d',' -f1)
@@ -37,7 +43,13 @@ singleton_outlier_experts=${13:-"false"}
 batch_size=1
 num_batches=1024
 truncate=false
-dataset_config_path=${14:-}
+dataset_config_path="${REAP_DATASET_CONFIG_PATH:-${14:-}}"
+
+# Shorthand: if arg 13 is a JSON config path (and arg 14 omitted), use it.
+if [[ -z "${dataset_config_path}" && "${singleton_outlier_experts}" == *.json ]]; then
+    dataset_config_path="${singleton_outlier_experts}"
+    singleton_outlier_experts="false"
+fi
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -49,6 +61,9 @@ echo "Evaluations: lm_eval: $run_lm_eval, evalplus: $run_evalplus, livecodebench
 echo "Using seed: $seed"
 
 echo "Running with model: $model_name, dataset: $dataset_name, compression ratio: $compression_ratio, pruning method: $pruning_method"
+if [[ -n "${dataset_config_path}" ]]; then
+    echo "Dataset config: ${dataset_config_path}"
+fi
 python src/reap/prune.py \
     --model-name $model_name \
     --dataset-name $dataset_name \
