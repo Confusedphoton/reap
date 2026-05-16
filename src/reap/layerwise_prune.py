@@ -114,6 +114,7 @@ def prepare_calibration_batches(
                 truncate=obs_args.truncate,
                 batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
+                dataset_config_path=ds_args.dataset_config_path,
             )
             for category, batches in category_data_batches.items():
                 all_batches.extend(batches)
@@ -133,6 +134,7 @@ def prepare_calibration_batches(
         truncate=obs_args.truncate,
         batches_per_category=obs_args.batches_per_category,
         batch_size=obs_args.batch_size,
+        dataset_config_path=ds_args.dataset_config_path,
     )
 
     # Flatten all batches into a single list

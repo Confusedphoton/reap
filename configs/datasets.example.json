@@ -1,0 +1,19 @@
+{
+  "datasets": {
+    "your-org/custom-instruct-dataset": {
+      "processor": "instruction",
+      "instruction_field": "instruction",
+      "output_field": "output",
+      "category_field": null
+    },
+    "your-org/custom-chat-dataset": {
+      "processor": "chat",
+      "messages_field": "messages",
+      "category_field": "source"
+    },
+    "your-org/raw-text-corpus": {
+      "processor": "lm",
+      "text_field": "text"
+    }
+  }
+}

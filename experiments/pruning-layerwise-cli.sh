@@ -35,6 +35,8 @@ singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
 num_batches=128
 batch_size=8
+truncate=false
+dataset_config_path=${14:-}
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -59,6 +61,8 @@ python -m reap.layerwise_prune \
     --output_file_name ${output_file_name} \
     --batches_per_category ${num_batches} \
     --batch_size ${batch_size} \
+    --truncate ${truncate} \
+    $([ -n "${dataset_config_path}" ] && echo --dataset-config-path "${dataset_config_path}") \
     --low_cpu_mem_usage True
 
 short_model_name=$(artifact_dir_name "$model_name")

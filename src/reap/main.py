@@ -220,6 +220,7 @@ def record_activations(
                 truncate=obs_args.truncate,
                 batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
+                dataset_config_path=ds_args.dataset_config_path,
             )
             combined_batches.extend(component_batches["all"])
 
@@ -236,6 +237,7 @@ def record_activations(
             truncate=obs_args.truncate,
             batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
+            dataset_config_path=ds_args.dataset_config_path,
         )
 
     logger.info(

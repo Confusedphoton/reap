@@ -93,6 +93,16 @@ class DatasetArgs:
     shuffle: bool = field(
         default=True, metadata={"help": "Whether to shuffle the dataset."}
     )
+    dataset_config_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional JSON file mapping HuggingFace dataset names to processor "
+                "settings. Used when a dataset is not in DATASET_REGISTRY; also "
+                "overrides auto-detection for listed datasets."
+            ),
+        },
+    )
     # for SFT only
     dataset_test_split: str = field(default="test", metadata={"help": "Dataset split to use for evaluation."})
 
@@ -113,7 +123,17 @@ class ObserverArgs:
     batch_size: int = 8
     model_max_length: int | None = 2048
     return_vllm_tokens_prompt: bool = False
-    truncate: bool = False
+    truncate: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, truncate during tokenizer encoding to model_max_length. "
+                "If false (default), encode without tokenizer truncation and clip "
+                "each example to model_max_length when building calibration batches "
+                "(long examples are included, not skipped)."
+            ),
+        },
+    )
     overwrite_observations: bool = field(
         default=False,
         metadata={"help": "Whether to overwrite existing observer data files."},

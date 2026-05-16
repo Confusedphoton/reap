@@ -36,6 +36,8 @@ singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
 batch_size=1
 num_batches=1024
+truncate=false
+dataset_config_path=${14:-}
 output_file_name="observations_${num_batches}_cosine-seed_${seed}.pt"
 
 
@@ -63,6 +65,8 @@ python src/reap/prune.py \
     --singleton_outlier_experts ${singleton_outlier_experts} \
     --batch_size ${batch_size} \
     --batches_per_category ${num_batches} \
+    --truncate ${truncate} \
+    $([ -n "${dataset_config_path}" ] && echo --dataset-config-path "${dataset_config_path}") \
     --record_pruning_metrics_only true
 
 short_model_name=$(artifact_dir_name "$model_name")

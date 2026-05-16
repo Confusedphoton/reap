@@ -16,7 +16,9 @@ token or a prompt-completion dataset for training on completions only with SFTTr
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 import uuid
 import json
 import re
@@ -28,6 +30,14 @@ import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
 from vllm import TokensPrompt
+
+from reap.dataset_config import (
+    DatasetProcessorSpec,
+    load_dataset_config_file,
+    make_map_fn,
+    processor_kind_to_base,
+    resolve_processor_spec,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -225,43 +235,19 @@ def _load_raw_dataset(dataset_name, split, subset=None):
         )
 
 
-def load_category_batches(
-    dataset_name,
-    split,
-    subset,
-    tokenizer,
-    model_max_length,
-    batch_size,
-    split_by_category,
-    return_vllm_tokens_prompt,
-    truncate,
-    batches_per_category,
-):
-    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
+_FILE_DATASET_CONFIGS: dict[str, dict[str, DatasetProcessorSpec]] = {}
 
-    # load dataset processor
-    proc_cls = DATASET_REGISTRY.get(dataset_name)
-    if proc_cls is None:
-        raise ValueError(
-            f"No DatasetProcessor registered for '{dataset_name}'. "
-            f"Supported: {list(DATASET_REGISTRY.keys())}"
+
+def _get_file_dataset_configs(
+    dataset_config_path: str | None,
+) -> dict[str, DatasetProcessorSpec]:
+    if dataset_config_path is None:
+        return {}
+    if dataset_config_path not in _FILE_DATASET_CONFIGS:
+        _FILE_DATASET_CONFIGS[dataset_config_path] = load_dataset_config_file(
+            dataset_config_path
         )
-
-    # init processor & process dataset
-    processor = proc_cls(
-        dataset=raw_ds,
-        tokenizer=tokenizer,
-        max_input_len=model_max_length,
-        split=split,
-        split_by_category=split_by_category,
-        return_vllm_tokens_prompt=return_vllm_tokens_prompt,
-        truncate=truncate,
-        batch_size=batch_size,
-    )
-    category_data_batches = processor.get_processed_dataset(
-        batches_per_category=batches_per_category,
-    )
-    return category_data_batches
+    return _FILE_DATASET_CONFIGS[dataset_config_path]
 
 
 # --- Base Dataset Processors --------------------------------------------------
@@ -298,8 +284,10 @@ class BaseDatasetProcessor(ABC):
             split_by_category (bool, optional): _description_. Defaults to True.
             return_vllm_tokens_prompt (bool, optional): If True, will return
                 TokensPrompt objects instead of BatchEncoding. Defaults to False
-            truncate (bool, optional): If True, will truncate the samples from
-                the dataset to the max_input_len instead of skipping them.
+            truncate (bool, optional): If True, apply tokenizer truncation to
+                ``max_input_len`` during encoding. If False, encode full text and
+                clip to ``max_input_len`` when building calibration batches (rows
+                are never dropped for length).
             batch_size (int, optional): Number of samples per batch. Defaults to 1.
 
         """
@@ -330,6 +318,7 @@ class BaseDatasetProcessor(ABC):
             select_only_categories = [select_only_categories]
         self.select_only_categories = select_only_categories
         self.batch_size = batch_size
+        self._row_map_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         if self.select_only_categories:
             logger.warning(
                 "select_only_categories is not None but split_by_category "
@@ -369,12 +358,22 @@ class BaseDatasetProcessor(ABC):
             "This method should be implemented by subclasses.",
         )
 
+    def _fit_encoded_sample(self, encoded_sample: torch.Tensor) -> torch.Tensor:
+        """Clip encoded tokens to ``max_input_len`` without dropping the row."""
+        if encoded_sample.shape[-1] > self.max_input_len:
+            return encoded_sample[:, : self.max_input_len]
+        return encoded_sample
+
+    def _map_dataset_rows(self) -> Dataset:
+        map_fn = self._row_map_fn or self._map_fn
+        return self.dataset.map(map_fn)
+
     def get_processed_dataset(
         self, batches_per_category: int
     ) -> dict[str, list[TokensPrompt]] | dict[str, list[BatchEncoding]]:
         """Get requests for each category in the dataset."""
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self._map_dataset_rows()
         if self.split_by_category:
             categories = (
                 self.categories
@@ -497,12 +496,7 @@ class BaseDatasetProcessor(ABC):
                 continue
             sampled.append(sample_idx)
             sample = category_dataset[sample_idx]
-            encoded_sample = self._encode_sample(sample)
-            if encoded_sample.shape[-1] > self.max_input_len:
-                if self.truncate:
-                    encoded_sample = encoded_sample[:, : self.max_input_len]
-                else:
-                    continue
+            encoded_sample = self._fit_encoded_sample(self._encode_sample(sample))
             attention_mask = torch.ones((1, encoded_sample.shape[-1]), dtype=torch.long)
 
             if self.return_vllm_tokens_prompt:
@@ -557,7 +551,9 @@ class BaseDatasetProcessor(ABC):
                     continue
                 sampled.append(sample_idx)
                 sample = category_dataset[sample_idx]
-                encoded_sample = self._encode_sample(sample)  # shape (batch, seq)
+                encoded_sample = self._fit_encoded_sample(
+                    self._encode_sample(sample)
+                )
                 end_seq = seq_idx + encoded_sample.shape[-1]
                 if end_seq > self.max_input_len:
                     encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
@@ -602,7 +598,7 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
         return self.tokenizer(
             chat_sample,
             truncation=self.truncate,
-            max_length=self.tokenizer.model_max_length if self.truncate else None,
+            max_length=self.max_input_len if self.truncate else None,
             return_tensors="pt",
         )["input_ids"]
 
@@ -628,7 +624,7 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
             return {"text": chat_sample}
 
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self._map_dataset_rows()
 
         return self._mapped_dataset.map(chat_template_fn)
 
@@ -638,7 +634,7 @@ class LMDatasetProcessor(BaseDatasetProcessor):
         return self.tokenizer(
             sample[self.text_field],
             truncation=self.truncate,
-            max_length=self.tokenizer.model_max_length if self.truncate else None,
+            max_length=self.max_input_len if self.truncate else None,
             return_tensors="pt",
         )["input_ids"]
 
@@ -646,9 +642,39 @@ class LMDatasetProcessor(BaseDatasetProcessor):
         """Get the mapped dataset without tokenization applied."""
 
         if self._mapped_dataset is None:
-            self._mapped_dataset = self.dataset.map(self._map_fn)
+            self._mapped_dataset = self._map_dataset_rows()
 
         return self._mapped_dataset
+
+
+class ConfiguredDatasetProcessor:
+    """Factory for dataset processors built from config or auto-detection."""
+
+    @classmethod
+    def for_spec(cls, spec: DatasetProcessorSpec) -> type[BaseDatasetProcessor]:
+        base_cls = (
+            LMDatasetProcessor
+            if processor_kind_to_base(spec) == "lm"
+            else ChatDatasetProcessor
+        )
+        row_map_fn = make_map_fn(spec)
+
+        class _ConfiguredProcessor(base_cls):
+            def __init__(self, **kwargs):
+                self.messages_field = spec.messages_field
+                self.text_field = spec.text_field
+                self.tools_field = spec.tools_field
+                self.category_field = spec.category_field
+                super().__init__(**kwargs)
+                self._row_map_fn = row_map_fn
+
+            @staticmethod
+            def _map_fn(sample: dict[str, Any]) -> dict[str, Any]:
+                return sample
+
+        _ConfiguredProcessor.__name__ = f"Configured{spec.processor.title()}Processor"
+        _ConfiguredProcessor.__qualname__ = _ConfiguredProcessor.__name__
+        return _ConfiguredProcessor
 
 
 ### --- Concrete Implementations -----------------------------------------------
@@ -962,7 +988,63 @@ class SWESmithTrajectoriesDataset(ChatDatasetProcessor):
         }
 
 
-DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
+def resolve_dataset_processor(
+    dataset_name: str,
+    dataset: Dataset,
+    dataset_config_path: str | None = None,
+) -> type[BaseDatasetProcessor]:
+    """Resolve a processor class for a dataset name."""
+    registered = DATASET_REGISTRY.get(dataset_name)
+    if registered is not None:
+        return registered
+
+    file_configs = _get_file_dataset_configs(dataset_config_path)
+    spec = resolve_processor_spec(dataset_name, dataset, file_configs)
+    logger.info(
+        "Using configurable processor '%s' for dataset '%s'",
+        spec.processor,
+        dataset_name,
+    )
+    return ConfiguredDatasetProcessor.for_spec(spec)
+
+
+def load_category_batches(
+    dataset_name,
+    split,
+    subset,
+    tokenizer,
+    model_max_length,
+    batch_size,
+    split_by_category,
+    return_vllm_tokens_prompt,
+    truncate,
+    batches_per_category,
+    dataset_config_path=None,
+):
+    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
+
+    proc_cls = resolve_dataset_processor(
+        dataset_name,
+        raw_ds,
+        dataset_config_path=dataset_config_path,
+    )
+
+    processor = proc_cls(
+        dataset=raw_ds,
+        tokenizer=tokenizer,
+        max_input_len=model_max_length,
+        split=split,
+        split_by_category=split_by_category,
+        return_vllm_tokens_prompt=return_vllm_tokens_prompt,
+        truncate=truncate,
+        batch_size=batch_size,
+    )
+    return processor.get_processed_dataset(
+        batches_per_category=batches_per_category,
+    )
+
+
+DATASET_REGISTRY: dict[str, type[BaseDatasetProcessor]] = {
     "m-a-p/CodeFeedback-Filtered-Instruction": CodeFeedbackChatDataset,
     "allenai/tulu-3-sft-mixture": TuluSFTMixtureChatDataset,
     "cais/mmlu": MmluChatDataset,
